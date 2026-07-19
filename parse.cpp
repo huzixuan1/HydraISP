@@ -1,0 +1,415 @@
+/**
+ * @file parse.cpp
+ * @author joker.mao (joker_mao@163.com)
+ * @brief
+ * @version 0.1
+ * @date 2023-07-29
+ *
+ * Copyright (c) of ADAS_EYES 2023
+ *
+ */
+
+#include "common/common.h"
+#include "modules/modules.h"
+#include "json.hpp"
+#include <fstream>
+#include <vector>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <limits.h>
+
+using json = nlohmann::json;
+
+namespace {
+
+bool PathExists(const std::string &path)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+std::string JoinPath(const std::string &base, const std::string &path)
+{
+    if (base.empty())
+    {
+        return path;
+    }
+
+    if (path.empty())
+    {
+        return base;
+    }
+
+    if (base.back() == '/' || path.front() == '/')
+    {
+        return base + path;
+    }
+
+    return base + "/" + path;
+}
+
+std::string GetCurrentWorkingDir()
+{
+    char buffer[PATH_MAX];
+    if (getcwd(buffer, sizeof(buffer)) == nullptr)
+    {
+        return ".";
+    }
+    return std::string(buffer);
+}
+
+std::string GetParentDir(const std::string &path)
+{
+    if (path.empty())
+    {
+        return ".";
+    }
+
+    auto pos = path.find_last_of("/\\");
+    if (pos == std::string::npos)
+    {
+        return ".";
+    }
+
+    if (pos == 0)
+    {
+        return "/";
+    }
+
+    return path.substr(0, pos);
+}
+
+std::string ResolveExistingPath(const std::string &input_path)
+{
+    if (input_path.empty())
+    {
+        return "";
+    }
+
+    if (input_path[0] == '/' || input_path[0] == '~' || (input_path.size() > 1 && input_path[1] == ':'))
+    {
+        return PathExists(input_path) ? input_path : "";
+    }
+
+    std::string cwd = GetCurrentWorkingDir();
+    std::vector<std::string> search_roots;
+    search_roots.push_back(cwd);
+
+    std::string current = cwd;
+    while (!current.empty() && current != ".")
+    {
+        search_roots.push_back(current);
+        current = GetParentDir(current);
+        if (current == search_roots.back())
+        {
+            break;
+        }
+    }
+
+    std::string candidate = JoinPath(cwd, input_path);
+    if (PathExists(candidate))
+    {
+        return candidate;
+    }
+
+    for (const auto &root : search_roots)
+    {
+        candidate = JoinPath(root, input_path);
+        if (PathExists(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    return input_path;
+}
+
+std::string ResolvePathForConfig(const std::string &input_path, const std::string &cfg_file_path, const std::string &cwd)
+{
+    if (input_path.empty())
+    {
+        return "";
+    }
+
+    if (input_path[0] == '/' || input_path[0] == '~' || (input_path.size() > 1 && input_path[1] == ':'))
+    {
+        return input_path;
+    }
+
+    std::vector<std::string> search_roots;
+    search_roots.push_back(cwd);
+
+    std::string cfg_dir = GetParentDir(cfg_file_path);
+    if (!cfg_dir.empty())
+    {
+        search_roots.push_back(cfg_dir);
+    }
+
+    std::string current = cfg_dir;
+    while (!current.empty() && current != ".")
+    {
+        search_roots.push_back(current);
+        current = GetParentDir(current);
+        if (current == search_roots.back())
+        {
+            break;
+        }
+    }
+
+    current = cwd;
+    while (!current.empty() && current != ".")
+    {
+        search_roots.push_back(current);
+        current = GetParentDir(current);
+        if (current == search_roots.back())
+        {
+            break;
+        }
+    }
+
+    for (const auto &root : search_roots)
+    {
+        std::string candidate = JoinPath(root, input_path);
+        if (PathExists(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    return input_path;
+}
+
+} // namespace
+
+std::list<std::string> split(const std::string &str, const std::string &pattern)
+{
+    std::list<std::string> res;
+    if (str == "")
+        return res;
+    std::string strs = str + pattern;
+    size_t pos = strs.find(pattern);
+
+    while (pos != strs.npos)
+    {
+        std::string temp = strs.substr(0, pos);
+        res.push_back(temp);
+
+        strs = strs.substr(pos + 1, strs.size());
+        pos = strs.find(pattern);
+    }
+
+    return res;
+}
+
+int ParseIspCfgFile(const std::string cfg_file_path, IspPrms &isp_prm)
+{
+    std::string resolved_cfg_path = ResolveExistingPath(cfg_file_path);
+    if (resolved_cfg_path.empty())
+    {
+        LOG(ERROR) << cfg_file_path << " open failed";
+        return -1;
+    }
+
+    std::ifstream fs(resolved_cfg_path);
+
+    if (!fs.is_open())
+    {
+        LOG(ERROR) << resolved_cfg_path << " open failed";
+        return -1;
+    }
+
+    json j_root;
+
+    fs >> j_root;
+
+    try {
+        std::string cwd = GetCurrentWorkingDir();
+        std::string cfg_dir = GetParentDir(resolved_cfg_path);
+
+        // raw path
+        isp_prm.raw_file = ResolvePathForConfig(j_root["raw_file"], cfg_dir, cwd);
+        isp_prm.out_file_path = ResolvePathForConfig(j_root["out_file_path"], cfg_dir, cwd);
+        // sensor info
+        isp_prm.sensor_name = j_root["info"]["sensor_name"];
+        LOG(INFO) << "Sensor Name: " << isp_prm.sensor_name;
+
+        auto cfa_str = j_root["info"]["cfa"];
+        if (cfa_str == "RGGB")
+        {
+            isp_prm.info.cfa = CfaTypes::RGGB;
+        }
+        else if (cfa_str == "BGGR")
+        {
+            isp_prm.info.cfa = CfaTypes::BGGR;
+        }
+        else if (cfa_str == "GBRG")
+        {
+            isp_prm.info.cfa = CfaTypes::GBRG;
+        }
+        else if (cfa_str == "GRBG")
+        {
+            isp_prm.info.cfa = CfaTypes::GRBG;
+        }
+        LOG(INFO) << "Sensor CFA: " << cfa_str;
+
+        auto raw_type_str = j_root["info"]["data_type"];
+        if (raw_type_str == "RAW10")
+        {
+            isp_prm.info.dt = RawDataTypes::RAW10;
+        }
+        else if (raw_type_str == "RAW12")
+        {
+            isp_prm.info.dt = RawDataTypes::RAW12;
+        }
+        else if (raw_type_str == "RAW14")
+        {
+            isp_prm.info.dt = RawDataTypes::RAW14;
+        }
+        else if (raw_type_str == "RAW16")
+        {
+            isp_prm.info.dt = RawDataTypes::RAW16;
+        }
+        LOG(INFO) << "Sensor DT: " << raw_type_str;
+
+        isp_prm.info.bpp = static_cast<int>(j_root["info"]["bpp"]);
+        int max_bit = int(j_root["info"]["max_bit"]);
+        isp_prm.info.max_val = (1 << max_bit) - 1;
+        isp_prm.info.width = static_cast<int>(j_root["info"]["width"]);
+        isp_prm.info.height = static_cast<int>(j_root["info"]["height"]);
+        isp_prm.info.mipi_packed = static_cast<int>(j_root["info"]["mipi_packed"]);
+        LOG(INFO) << "Sensor Resolution: " << isp_prm.info.width << "*" << isp_prm.info.height;
+        //
+        std::string pipeline = j_root["pipe"];
+        isp_prm.pipe = std::move(split(pipeline, "|"));
+        // blc
+        isp_prm.blc = j_root["blc"];
+        // wbgain
+        auto d65_gains = j_root["wb_gain"]["d65_gain"];
+        if (d65_gains.size() != 4)
+        {
+            LOG(ERROR) << "d65 gains size error";
+            return -1;
+        }
+        for (int i = 0; i < d65_gains.size(); ++i)
+        {
+            isp_prm.wb_gains.d65_gain[i] = d65_gains[i];
+            //LOG(INFO) << "d65" << isp_prm.wb_gains.d65_gain[i];
+        }
+        auto d50_gains = j_root["wb_gain"]["d50_gain"];
+        if (d50_gains.size() != 4)
+        {
+            LOG(ERROR) << "d50 gains size error";
+            return -1;
+        }
+        for (int i = 0; i < d50_gains.size(); ++i)
+        {
+            isp_prm.wb_gains.d50_gain[i] = d50_gains[i];
+        }
+
+        // pwl
+        isp_prm.depwl_prm.pedestal = j_root["depwl"]["pedestal"];
+        isp_prm.depwl_prm.pwl_nums = j_root["depwl"]["pwl_nums"];
+        auto pwl_x = j_root["depwl"]["pwl_x"];
+        auto pwl_y = j_root["depwl"]["pwl_y"];
+        auto pwl_slope = j_root["depwl"]["slope"];
+        if ((pwl_x.size() != isp_prm.depwl_prm.pwl_nums) || (pwl_y.size() != isp_prm.depwl_prm.pwl_nums) || (pwl_slope.size() != isp_prm.depwl_prm.pwl_nums))
+        {
+            LOG(ERROR) << "pwl input prms error";
+            return -1;
+        }
+
+        for (int i = 0; i < isp_prm.depwl_prm.pwl_nums; ++i)
+        {
+            isp_prm.depwl_prm.x_cood[i] = pwl_x[i];
+            isp_prm.depwl_prm.y_cood[i] = pwl_y[i];
+            isp_prm.depwl_prm.slope[i] = pwl_slope[i];
+        }
+
+        // pwl
+        isp_prm.ltm_prms.constrast = j_root["ltm"]["constrast"];
+        isp_prm.ltm_prms.in_bits = j_root["ltm"]["in_bit"];
+        isp_prm.ltm_prms.out_bits = j_root["ltm"]["out_bit"];
+
+        isp_prm.rgb_gamma.nums = j_root["rgbgamma"]["gammalut_nums"];
+        isp_prm.rgb_gamma.in_bits = j_root["rgbgamma"]["in_bit"];
+        isp_prm.rgb_gamma.out_bits = j_root["rgbgamma"]["out_bit"];
+        auto gamma_curve = j_root["rgbgamma"]["gammalut"];
+        if (gamma_curve.size() != isp_prm.rgb_gamma.nums)
+        {
+            LOG(ERROR) << "rgb gamma input prms error";
+            return -1;
+        }
+
+        for (int i = 0; i < gamma_curve.size(); ++i)
+        {
+            isp_prm.rgb_gamma.curve[i] = gamma_curve[i];
+        }
+
+        isp_prm.y_gamma.nums = j_root["ygamma"]["gammalut_nums"];
+        isp_prm.y_gamma.in_bits = j_root["ygamma"]["in_bit"];
+        isp_prm.y_gamma.out_bits = j_root["ygamma"]["out_bit"];
+        gamma_curve = j_root["ygamma"]["gammalut"];
+        if (gamma_curve.size() != isp_prm.y_gamma.nums)
+        {
+            LOG(ERROR) << "y gamma input prms error";
+            return -1;
+        }
+
+        for (int i = 0; i < gamma_curve.size(); ++i)
+        {
+            isp_prm.y_gamma.curve[i] = gamma_curve[i];
+        }
+
+        isp_prm.sat_prms.rotate_angle = j_root["saturation"]["rotate_angle"];
+
+        isp_prm.contrast_prms.ratio = j_root["contrast"]["ratio"];
+
+        isp_prm.sharpen_prms.ratio = j_root["sharpen"]["ratio"];
+
+        isp_prm.dpc_prms.thres = j_root["dpc"]["thres"];
+
+        std::string dpc_mode =  j_root["dpc"]["mode"];
+        if (dpc_mode == "mean") {
+            isp_prm.dpc_prms.mode = DpcMode::MEAN;
+        } else {
+            isp_prm.dpc_prms.mode = DpcMode::GRADIENT;
+        }
+
+        if ((j_root["lsc"]["mesh_width_nums"] != kLscMeshPointHNums)
+            || (j_root["lsc"]["mesh_height_nums"] != kLscMeshPointVNums)) {
+            LOG(ERROR) << "lsc config prms error";
+            return -1;
+        }
+
+
+        auto lsc_data_arr = j_root["lsc"]["data"];
+        if (lsc_data_arr.size() != kLscMeshPointVNums) {
+            LOG(ERROR) << "lsc config lsc_data_arr error";
+            return -1;
+        }
+
+        for (int idy = 0; idy < kLscMeshPointVNums; ++idy) {
+            auto arr = lsc_data_arr[idy];
+            if (arr.size() != kLscMeshPointHNums) {
+                LOG(ERROR) << "lsc config lsc_data_arr error";
+                return -1;
+            }
+            for (int idx = 0; idx < kLscMeshPointHNums; ++idx) {
+                //first verison, use one prm
+                isp_prm.lsc_prms.mesh_b[idy][idx] = arr[idx];
+                isp_prm.lsc_prms.mesh_gr[idy][idx] = arr[idx];
+                isp_prm.lsc_prms.mesh_gb[idy][idx] = arr[idx];
+                isp_prm.lsc_prms.mesh_r[idy][idx] = arr[idx];
+            }
+        }
+    } catch (std::exception& e) {
+        LOG(ERROR) << "parse failed " << e.what();
+        fs.close();
+        return -1;
+    }
+
+
+    fs.close();
+    LOG(INFO) << "parse exit";
+    return 0;
+}

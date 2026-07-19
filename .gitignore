@@ -1,0 +1,21 @@
+# Build artifacts
+/build/
+/build/*
+/cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+Makefile
+
+# Object files and binaries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# macOS
+.DS_Store
