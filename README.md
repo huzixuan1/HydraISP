@@ -180,6 +180,10 @@ Example:
     --config configs/camera/example.json \
     --input assets/raw/input.raw
 
+./isp_testbed ../config/isp_config_cannon.json
+
+./isp_testbed ../config/isp_config_dsc.json
+
 ```
 
 ---
